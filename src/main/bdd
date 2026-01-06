@@ -1,0 +1,320 @@
+CREATE DATABASE IF NOT EXISTS gestion_rentree
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+USE gestion_rentree;
+
+-- -----------------------
+-- Rôles / utilisateurs
+-- -----------------------
+CREATE TABLE roles (
+  id_role   INT AUTO_INCREMENT PRIMARY KEY,
+  code      VARCHAR(30) NOT NULL UNIQUE,   -- SECRETAIRE, PROFESSEUR, GEST_STOCK, ADMIN (option)
+  libelle   VARCHAR(100) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO roles(code, libelle) VALUES
+('ADMIN','Administrateur'),
+('SECRETAIRE','Secrétaire'),
+('PROFESSEUR','Professeur'),
+('GEST_STOCK','Gestionnaire de stock')
+ON DUPLICATE KEY UPDATE libelle=VALUES(libelle);
+
+CREATE TABLE utilisateurs (
+  id_user        BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_role        INT NOT NULL,
+  nom            VARCHAR(80) NOT NULL,
+  prenom         VARCHAR(80) NOT NULL,
+  email          VARCHAR(190) NOT NULL UNIQUE,
+  password_hash  VARCHAR(255) NOT NULL,       -- hash (BCrypt/Argon2 côté Java)
+  actif          TINYINT(1) NOT NULL DEFAULT 1,
+  last_login_at  DATETIME NULL,               -- dernière connexion
+  created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_user_role FOREIGN KEY (id_role) REFERENCES roles(id_role)
+) ENGINE=InnoDB;
+
+-- Journal des connexions (historique complet)
+CREATE TABLE auth_sessions (
+  id_session   BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_user      BIGINT NOT NULL,
+  login_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  logout_at    DATETIME NULL,
+  ip           VARCHAR(45) NULL,
+  user_agent   VARCHAR(255) NULL,
+  success      TINYINT(1) NOT NULL DEFAULT 1,
+  CONSTRAINT fk_session_user FOREIGN KEY (id_user) REFERENCES utilisateurs(id_user),
+  INDEX idx_session_user_date (id_user, login_at)
+) ENGINE=InnoDB;
+
+-- Traçabilité RGPD (créations/modifs/validations)
+CREATE TABLE audit_log (
+  id_audit     BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_user      BIGINT NOT NULL,
+  action       VARCHAR(40) NOT NULL,      -- CREATE/UPDATE/DELETE/VALIDATE/REFUSE...
+  entity_type  VARCHAR(60) NOT NULL,      -- ETUDIANT, DOSSIER, RDV, FOURNITURE, DEMANDE...
+  entity_id    BIGINT NULL,
+  description  VARCHAR(500) NULL,
+  created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_audit_user FOREIGN KEY (id_user) REFERENCES utilisateurs(id_user),
+  INDEX idx_audit_entity (entity_type, entity_id),
+  INDEX idx_audit_date (created_at)
+) ENGINE=InnoDB;
+
+-- -----------------------
+-- Étudiants / inscriptions
+-- -----------------------
+CREATE TABLE etudiants (
+  id_etudiant        BIGINT AUTO_INCREMENT PRIMARY KEY,
+  nom               VARCHAR(80) NOT NULL,
+  prenom            VARCHAR(80) NOT NULL,
+  dernier_diplome   VARCHAR(120) NOT NULL,
+  email             VARCHAR(190) NULL,
+  telephone         VARCHAR(30) NULL,
+  adresse           VARCHAR(255) NULL,
+  created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_etudiant_nom_prenom (nom, prenom)
+) ENGINE=InnoDB;
+
+-- Dossier d’inscription créé par secrétaire
+CREATE TABLE dossiers_inscription (
+  id_dossier     BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_etudiant    BIGINT NOT NULL,
+  created_by     BIGINT NOT NULL,            -- secrétaire
+  date_heure     DATETIME NOT NULL,          -- date/heure création dossier
+  filiere        VARCHAR(120) NOT NULL,      -- filière d’intérêt
+  motivations    TEXT NOT NULL,
+  statut         VARCHAR(20) NOT NULL DEFAULT 'NOUVEAU',
+  -- NOUVEAU / EN_ETUDE / RETENU / REFUSE / CLOS
+  updated_at     DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+  created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_statut_dossier CHECK (statut IN ('NOUVEAU','EN_ETUDE','RETENU','REFUSE','CLOS')),
+  CONSTRAINT fk_dossier_etudiant FOREIGN KEY (id_etudiant) REFERENCES etudiants(id_etudiant),
+  CONSTRAINT fk_dossier_secretaire FOREIGN KEY (created_by) REFERENCES utilisateurs(id_user),
+
+  INDEX idx_dossier_statut (statut),
+  INDEX idx_dossier_filiere (filiere),
+  INDEX idx_dossier_date (date_heure)
+) ENGINE=InnoDB;
+
+-- Affectation/prise en charge par un professeur (historique possible)
+CREATE TABLE dossier_traitements (
+  id_traitement    BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_dossier       BIGINT NOT NULL,
+  id_professeur    BIGINT NOT NULL,
+  commentaire      TEXT NULL,
+  decision         VARCHAR(20) NULL,     -- RETENU/REFUSE/NULL
+  decided_at       DATETIME NULL,
+  created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_decision CHECK (decision IS NULL OR decision IN ('RETENU','REFUSE')),
+  CONSTRAINT fk_trait_dossier FOREIGN KEY (id_dossier) REFERENCES dossiers_inscription(id_dossier),
+  CONSTRAINT fk_trait_prof FOREIGN KEY (id_professeur) REFERENCES utilisateurs(id_user),
+
+  INDEX idx_trait_dossier (id_dossier),
+  INDEX idx_trait_prof (id_professeur)
+) ENGINE=InnoDB;
+
+-- -----------------------
+-- Salles / Rendez-vous
+-- -----------------------
+CREATE TABLE salles (
+  id_salle     INT AUTO_INCREMENT PRIMARY KEY,
+  code         VARCHAR(20) NOT NULL UNIQUE,   -- ex: SALLE_1, SALLE_2, SALLE_3
+  active       TINYINT(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB;
+
+-- Pré-remplissage des 3 salles
+INSERT INTO salles(code, active) VALUES
+('SALLE_1',1),('SALLE_2',1),('SALLE_3',1)
+ON DUPLICATE KEY UPDATE active=VALUES(active);
+
+-- Rendez-vous = une demi-journée (AM/PM) à une date
+CREATE TABLE rendez_vous (
+  id_rdv         BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_dossier     BIGINT NOT NULL,
+  id_etudiant    BIGINT NOT NULL,
+  id_professeur  BIGINT NOT NULL,
+  id_salle       INT NOT NULL,
+  date_rdv       DATE NOT NULL,
+  demi_journee   VARCHAR(2) NOT NULL,          -- AM / PM
+  sujet          VARCHAR(255) NULL,
+  statut         VARCHAR(20) NOT NULL DEFAULT 'PLANIFIE',
+  -- PLANIFIE / ANNULE / TERMINE
+  created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_demi_journee CHECK (demi_journee IN ('AM','PM')),
+  CONSTRAINT chk_statut_rdv CHECK (statut IN ('PLANIFIE','ANNULE','TERMINE')),
+
+  CONSTRAINT fk_rdv_dossier FOREIGN KEY (id_dossier) REFERENCES dossiers_inscription(id_dossier),
+  CONSTRAINT fk_rdv_etudiant FOREIGN KEY (id_etudiant) REFERENCES etudiants(id_etudiant),
+  CONSTRAINT fk_rdv_prof FOREIGN KEY (id_professeur) REFERENCES utilisateurs(id_user),
+  CONSTRAINT fk_rdv_salle FOREIGN KEY (id_salle) REFERENCES salles(id_salle),
+
+  -- IMPORTANT: empêche 2 RDV dans la même salle, même date, même demi-journée
+  UNIQUE KEY uq_salle_creneau (id_salle, date_rdv, demi_journee),
+
+  INDEX idx_rdv_prof_date (id_professeur, date_rdv),
+  INDEX idx_rdv_etudiant_date (id_etudiant, date_rdv)
+) ENGINE=InnoDB;
+
+-- Vue pratique: créneaux occupés
+CREATE OR REPLACE VIEW v_creneaux_occupes AS
+SELECT id_salle, date_rdv, demi_journee, statut
+FROM rendez_vous
+WHERE statut = 'PLANIFIE';
+
+-- -----------------------
+-- Fournitures / fournisseurs / stock
+-- -----------------------
+CREATE TABLE fournitures (
+  id_fourniture   BIGINT AUTO_INCREMENT PRIMARY KEY,
+  libelle         VARCHAR(120) NOT NULL,
+  description     TEXT NULL,
+  stock_actuel    INT NOT NULL DEFAULT 0,
+  stock_min       INT NOT NULL DEFAULT 0,
+  actif           TINYINT(1) NOT NULL DEFAULT 1,
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_stock_nonneg CHECK (stock_actuel >= 0),
+  CONSTRAINT chk_stockmin_nonneg CHECK (stock_min >= 0),
+
+  INDEX idx_fourniture_libelle (libelle)
+) ENGINE=InnoDB;
+
+CREATE TABLE fournisseurs (
+  id_fournisseur  BIGINT AUTO_INCREMENT PRIMARY KEY,
+  nom             VARCHAR(150) NOT NULL UNIQUE,
+  email           VARCHAR(190) NULL,
+  telephone       VARCHAR(30) NULL,
+  adresse         VARCHAR(255) NULL,
+  actif           TINYINT(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB;
+
+-- N-N: une fourniture peut avoir plusieurs fournisseurs, avec prix
+CREATE TABLE fourniture_fournisseur (
+  id_fourniture    BIGINT NOT NULL,
+  id_fournisseur   BIGINT NOT NULL,
+  prix_unitaire    DECIMAL(10,2) NOT NULL,
+  delai_jours      INT NULL,
+  PRIMARY KEY (id_fourniture, id_fournisseur),
+
+  CONSTRAINT chk_prix_ff CHECK (prix_unitaire >= 0),
+  CONSTRAINT fk_ff_fourniture FOREIGN KEY (id_fourniture) REFERENCES fournitures(id_fourniture),
+  CONSTRAINT fk_ff_fournisseur FOREIGN KEY (id_fournisseur) REFERENCES fournisseurs(id_fournisseur)
+) ENGINE=InnoDB;
+
+-- -----------------------
+-- Demandes de fournitures (prof -> gestionnaire stock)
+-- -----------------------
+CREATE TABLE demandes_fournitures (
+  id_demande      BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_professeur   BIGINT NOT NULL,
+  raison          VARCHAR(255) NOT NULL,
+  statut          VARCHAR(20) NOT NULL DEFAULT 'EN_ATTENTE',
+  -- EN_ATTENTE / VALIDEE / REFUSEE
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  decided_by      BIGINT NULL,     -- gestionnaire stock
+  decided_at      DATETIME NULL,
+  justification_refus VARCHAR(255) NULL,
+
+  CONSTRAINT chk_statut_dem CHECK (statut IN ('EN_ATTENTE','VALIDEE','REFUSEE')),
+  CONSTRAINT fk_dem_prof FOREIGN KEY (id_professeur) REFERENCES utilisateurs(id_user),
+  CONSTRAINT fk_dem_decider FOREIGN KEY (decided_by) REFERENCES utilisateurs(id_user),
+
+  INDEX idx_dem_statut (statut),
+  INDEX idx_dem_date (created_at)
+) ENGINE=InnoDB;
+
+-- Lignes de demande (articles + quantités)
+CREATE TABLE demande_fourniture_lignes (
+  id_ligne       BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_demande     BIGINT NOT NULL,
+  id_fourniture  BIGINT NOT NULL,
+  quantite       INT NOT NULL,
+
+  CONSTRAINT chk_qte_ligne CHECK (quantite > 0),
+  CONSTRAINT fk_ligne_dem FOREIGN KEY (id_demande) REFERENCES demandes_fournitures(id_demande) ON DELETE CASCADE,
+  CONSTRAINT fk_ligne_fourniture FOREIGN KEY (id_fourniture) REFERENCES fournitures(id_fourniture),
+
+  INDEX idx_ligne_demande (id_demande)
+) ENGINE=InnoDB;
+
+-- -----------------------
+-- Mouvements de stock (traçabilité)
+-- -----------------------
+CREATE TABLE stock_mouvements (
+  id_mvt          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_fourniture   BIGINT NOT NULL,
+  type_mvt        VARCHAR(15) NOT NULL,   -- ENTREE / SORTIE / AJUSTEMENT
+  quantite        INT NOT NULL,           -- peut être négatif si AJUSTEMENT/SORTIE (selon ta logique)
+  reason          VARCHAR(255) NULL,
+
+  id_demande      BIGINT NULL,            -- sortie liée à une demande validée
+  id_commande     BIGINT NULL,            -- entrée liée à une commande reçue
+
+  done_by         BIGINT NOT NULL,
+  done_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_type_mvt2 CHECK (type_mvt IN ('ENTREE','SORTIE','AJUSTEMENT')),
+  CONSTRAINT chk_quantite_nonzero CHECK (quantite <> 0),
+
+  CONSTRAINT fk_mvt_fourniture FOREIGN KEY (id_fourniture) REFERENCES fournitures(id_fourniture),
+  CONSTRAINT fk_mvt_demande FOREIGN KEY (id_demande) REFERENCES demandes_fournitures(id_demande),
+  CONSTRAINT fk_mvt_user FOREIGN KEY (done_by) REFERENCES utilisateurs(id_user),
+
+  INDEX idx_mvt_fourniture_date (id_fourniture, done_at)
+) ENGINE=InnoDB;
+
+-- -----------------------
+-- Commandes de réapprovisionnement (gestionnaire -> fournisseur)
+-- -----------------------
+CREATE TABLE commandes_reappro (
+  id_commande      BIGINT AUTO_INCREMENT PRIMARY KEY,
+  id_fourniture    BIGINT NOT NULL,
+  id_fournisseur   BIGINT NOT NULL,
+  quantite         INT NOT NULL,
+  prix_unitaire    DECIMAL(10,2) NOT NULL,
+  statut           VARCHAR(20) NOT NULL DEFAULT 'COMMANDEE',
+  -- COMMANDEE / RECUE / ANNULEE
+  ordered_by       BIGINT NOT NULL,
+  ordered_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  received_at      DATETIME NULL,
+
+  CONSTRAINT chk_qte_cmd CHECK (quantite > 0),
+  CONSTRAINT chk_statut_cmd CHECK (statut IN ('COMMANDEE','RECUE','ANNULEE')),
+
+  CONSTRAINT fk_cmd_fourniture FOREIGN KEY (id_fourniture) REFERENCES fournitures(id_fourniture),
+  CONSTRAINT fk_cmd_fournisseur FOREIGN KEY (id_fournisseur) REFERENCES fournisseurs(id_fournisseur),
+  CONSTRAINT fk_cmd_user FOREIGN KEY (ordered_by) REFERENCES utilisateurs(id_user),
+
+  INDEX idx_cmd_statut (statut),
+  INDEX idx_cmd_date (ordered_at)
+) ENGINE=InnoDB;
+
+-- Ajout FK vers commandes dans stock_mouvements (après création)
+ALTER TABLE stock_mouvements
+  ADD CONSTRAINT fk_mvt_commande
+  FOREIGN KEY (id_commande) REFERENCES commandes_reappro(id_commande);
+
+-- -----------------------
+-- Vues utiles
+-- -----------------------
+
+-- Alertes stock faible
+CREATE OR REPLACE VIEW v_alertes_stock_faible AS
+SELECT *
+FROM fournitures
+WHERE actif = 1 AND stock_actuel <= stock_min;
+
+-- Historique demandes par professeur (simple vue)
+CREATE OR REPLACE VIEW v_demandes_par_prof AS
+SELECT d.id_demande, d.id_professeur, u.nom, u.prenom, d.statut, d.created_at, d.raison
+FROM demandes_fournitures d
+JOIN utilisateurs u ON u.id_user = d.id_professeur;
+
